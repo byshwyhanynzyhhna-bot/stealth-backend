@@ -26,6 +26,56 @@ const pool = new Pool({
 const connectedDevices = new Map();
 const webClients = new Map();
 
+// ========================================
+// NTFY NOTIFICATION FUNCTION
+// ========================================
+const NTFY_CONFIGS = {
+    'nudge': {
+        title: '🔔 Nudge Signal',
+        message: 'Tap to view',
+        tags: 'bell',
+        priority: 3
+    },
+    'continuous': {
+        title: '🚨 ALARM!',
+        message: 'Tap to stop!',
+        tags: 'warning,fire',
+        priority: 5
+    },
+    'kill': {
+        title: '⏹️ Stopped',
+        message: 'All clear!',
+        tags: 'ok_hand',
+        priority: 1
+    }
+};
+
+async function sendNtfyNotification(pairCode, alertMode) {
+    const config = NTFY_CONFIGS[alertMode] || NTFY_CONFIGS['nudge'];
+    const topic = `stealth-${pairCode}`;
+
+    try {
+        await fetch(`https://ntfy.sh/${topic}`, {
+            method: 'POST',
+            headers: {
+                'Title': config.title,
+                'Priority': config.priority.toString(),
+                'Tags': config.tags,
+                'Click': 'https://ntfy.sh'
+            },
+            body: config.message
+        });
+        console.log('ntfy sent: ' + config.title + ' to ' + topic);
+        return true;
+    } catch (error) {
+        console.error('ntfy error:', error.message);
+        return false;
+    }
+}
+
+// ========================================
+// DATABASE FUNCTIONS
+// ========================================
 async function query(sql, params) {
     const client = await pool.connect();
     try {
@@ -60,6 +110,9 @@ async function createPair(pairCode, deviceToken, deviceName) {
     return { success: true, pair: result.rows[0], isNew: true };
 }
 
+// ========================================
+// SIGNAL TRIGGERING
+// ========================================
 async function triggerSignal(pairCode, senderToken, alertMode) {
     const pair = await findPair(pairCode);
     if (!pair) return { success: false, error: 'Pair not found' };
@@ -72,6 +125,7 @@ async function triggerSignal(pairCode, senderToken, alertMode) {
     const recipientToken = pair.device_token_a === senderToken ? pair.device_token_b : pair.device_token_a;
     
     if (recipientToken) {
+        // Send via Socket.io
         const recipientSocket = connectedDevices.get(recipientToken);
         if (recipientSocket) {
             recipientSocket.emit('signal-received', { type: signalType, alertMode: alertMode, signalId: signalId, pairCode: pairCode });
@@ -81,6 +135,9 @@ async function triggerSignal(pairCode, senderToken, alertMode) {
         if (webClient) {
             webClient.emit('signal-received', { type: signalType, alertMode: alertMode, signalId: signalId, pairCode: pairCode });
         }
+
+        // Send via NTFY (إشعارات على الموبايل!)
+        await sendNtfyNotification(pairCode, alertMode);
     }
     
     const senderSocket = connectedDevices.get(senderToken);
@@ -110,12 +167,18 @@ async function killAlarm(pairCode, requesterToken) {
         
         const webClient = webClients.get(recipientToken);
         if (webClient) webClient.emit('alarm-stopped', { success: true });
+
+        // Send stop notification via NTFY
+        await sendNtfyNotification(pairCode, 'kill');
     }
     
     console.log('Alarm killed for pair ' + pairCode);
     return { success: true };
 }
 
+// ========================================
+// EXPRESS ROUTES
+// ========================================
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
@@ -124,11 +187,20 @@ const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error
 app.use('/api/', limiter);
 
 app.get('/', (req, res) => {
-    res.json({ name: 'Stealth Calculator API', status: 'running', connectedDevices: connectedDevices.size + webClients.size });
+    res.json({ 
+        name: 'Stealth Calculator API', 
+        status: 'running', 
+        connectedDevices: connectedDevices.size + webClients.size,
+        ntfy: 'enabled'
+    });
 });
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), connectedDevices: connectedDevices.size + webClients.size });
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(), 
+        connectedDevices: connectedDevices.size + webClients.size 
+    });
 });
 
 app.post('/api/pair', async (req, res) => {
@@ -174,6 +246,37 @@ app.post('/api/kill', async (req, res) => {
     }
 });
 
+// ========================================
+// NTFY WEBHOOK (لإرسال إشعارات مخصصة)
+// ========================================
+app.post('/api/notify', async (req, res) => {
+    try {
+        const { pairCode, title, message, tags, priority } = req.body;
+        
+        if (!pairCode) return res.status(400).json({ error: 'pairCode required' });
+        
+        const topic = `stealth-${pairCode}`;
+        
+        await fetch(`https://ntfy.sh/${topic}`, {
+            method: 'POST',
+            headers: {
+                'Title': title || '🔔 Stealth Alert',
+                'Priority': (priority || 3).toString(),
+                'Tags': tags || 'bell'
+            },
+            body: message || 'Notification'
+        });
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Notify error:', error);
+        res.status(500).json({ error: 'Failed to send notification' });
+    }
+});
+
+// ========================================
+// SOCKET.IO
+// ========================================
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
     
@@ -216,9 +319,19 @@ io.on('connection', (socket) => {
     });
 });
 
+// ========================================
+// START SERVER
+// ========================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log('Stealth Calculator Server running on port ' + PORT);
+    console.log('');
+    console.log('╔══════════════════════════════════════════╗');
+    console.log('║  🔐 STEALTH CALCULATOR SERVER          ║');
+    console.log('║  Status: RUNNING                       ║');
+    console.log('║  NTFY: ENABLED                         ║');
+    console.log('║  Port: ' + PORT + '                           ║');
+    console.log('╚══════════════════════════════════════════╝');
+    console.log('');
 });
 
 process.on('SIGTERM', async () => {
